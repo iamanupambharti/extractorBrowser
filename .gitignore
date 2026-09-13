@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+
+# Playwright & Browser data
+playwright-report/
+test-results/
+data/browser_profile/
+browser_profile/
+
+# Local application data and artifacts
+data/
+*.log
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
