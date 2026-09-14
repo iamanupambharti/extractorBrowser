@@ -1,0 +1,7 @@
+playwright>=1.40.0
+pymupdf>=1.23.0
+pydantic>=2.5.0
+jsonschema>=4.20.0
+pytest>=8.0.0
+streamlit>=1.30.0
+rich>=13.7.0
