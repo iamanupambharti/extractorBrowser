@@ -5,6 +5,7 @@ viewing audit trails, and managing persistent configurations.
 """
 from pathlib import Path
 import json
+import os
 import streamlit as st
 import time
 import shutil
@@ -12,6 +13,8 @@ import shutil
 from core.config import config
 from core.state_machine import JobState
 from core.job_manager import job_manager, inspect_pdf, calculate_sha256
+from core.gemini_api_engine import gemini_api_engine
+from browser.launch import browser_manager
 from storage.database import db
 from storage.artifacts import artifacts
 
@@ -48,6 +51,88 @@ tab_selection = st.sidebar.radio(
     "Navigation",
     ["🚀 Dashboard", "📋 Job Ledger", "🔍 Question Review", "⚙️ Settings"],
 )
+
+# Engine Mode Selector
+st.sidebar.divider()
+st.sidebar.subheader("⚙️ Engine Mode")
+engine_options = [
+    "⚡ Gemini API (Recommended - No Bot Block)",
+    "🌐 Real Chrome Browser (Web UI)",
+]
+current_engine_idx = 0 if config.engine_type == "api" else 1
+engine_choice = st.sidebar.radio(
+    "Extraction Engine",
+    engine_options,
+    index=current_engine_idx,
+    help="Gemini API is fast, reliable, and completely immune to bot detection. Browser mode automates the web UI.",
+)
+config.engine_type = "api" if "Gemini API" in engine_choice else "browser"
+
+if config.engine_type == "api":
+    st.sidebar.caption("Official Google GenAI SDK (Fast, Structured JSON)")
+    
+    # Model selection
+    model_choice = st.sidebar.selectbox(
+        "Gemini Model",
+        ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        index=0 if "2.5-flash" in config.gemini_model else (1 if "1.5-flash" in config.gemini_model else 2),
+    )
+    config.gemini_model = model_choice
+
+    # API Key Input
+    saved_key = config.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+    key_input = st.sidebar.text_input(
+        "Gemini API Key",
+        value=saved_key,
+        type="password",
+        placeholder="Paste AI Studio API key here...",
+        help="Get a free key at https://aistudio.google.com/app/apikey"
+    )
+    if key_input:
+        config.gemini_api_key = key_input.strip()
+
+    col_k1, col_k2 = st.sidebar.columns(2)
+    with col_k1:
+        if st.sidebar.button("🧪 Test Key", use_container_width=True):
+            if not config.gemini_api_key:
+                st.sidebar.error("Please enter an API key first.")
+            else:
+                ok, msg = gemini_api_engine.test_connection(config.gemini_api_key)
+                if ok:
+                    st.sidebar.success(msg)
+                else:
+                    st.sidebar.error(msg)
+    with col_k2:
+        if st.sidebar.button("💾 Save Key", use_container_width=True):
+            if config.gemini_api_key:
+                env_path = config.base_dir / ".env"
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write(f"GEMINI_API_KEY={config.gemini_api_key}\nGEMINI_MODEL={config.gemini_model}\n")
+                st.sidebar.success("Saved to .env!")
+
+    if not config.gemini_api_key:
+        st.sidebar.info("👉 [Get a Free Gemini API Key](https://aistudio.google.com/app/apikey)")
+else:
+    st.sidebar.caption("Browser Web UI Mode")
+    config.provider = st.sidebar.selectbox(
+        "Assistant",
+        ["gemini", "chatgpt"],
+        index=0 if config.provider == "gemini" else 1,
+    )
+    config.target_url = config.gemini_url if config.provider == "gemini" else config.chatgpt_url
+    
+    cdp_toggle = st.sidebar.checkbox(
+        "Connect via CDP to Real Chrome (:9222)",
+        value=config.use_cdp,
+        help="Connects to genuine installed Chrome without automation flags."
+    )
+    config.use_cdp = cdp_toggle
+
+    if st.sidebar.button("🌐 Launch Real Chrome (:9222)", use_container_width=True):
+        import subprocess
+        import sys
+        subprocess.Popen([sys.executable, "launch_real_chrome.py"])
+        st.sidebar.success("Launched authentic Chrome on port 9222!")
 
 # ----------------------------------------------------
 # TAB 1: DASHBOARD
@@ -103,21 +188,71 @@ if tab_selection == "🚀 Dashboard":
         active = job_manager.get_active_job()
 
         start_disabled = (target_pdf_path is None) or (active is not None)
+        btn_label = "⚡ Start Gemini API Extraction" if config.engine_type == "api" else "🚀 Start Browser Extraction Job"
 
-        if st.button("🚀 Start Extraction Job", disabled=start_disabled, type="primary"):
-            try:
-                new_job = job_manager.create_job(target_pdf_path, expected_count=expected_count)
-                job_manager.start_job_async(new_job["id"], target_pdf_path, expected_count=expected_count)
-                st.success(f"Job `{new_job['id']}` started! Chromium browser launched.")
-                time.sleep(1)
-                st.rerun()
-            except Exception as ex:
-                st.error(f"Job initialization error: {ex}")
+        if st.button(btn_label, disabled=start_disabled, type="primary"):
+            if config.engine_type == "api" and not config.gemini_api_key.strip():
+                st.error("⚠️ Please enter a Gemini API Key in the left sidebar before starting.")
+            else:
+                try:
+                    new_job = job_manager.create_job(target_pdf_path, expected_count=expected_count)
+                    job_manager.start_job_async(new_job["id"], target_pdf_path, expected_count=expected_count)
+                    engine_desc = f"Gemini API ({config.gemini_model})" if config.engine_type == "api" else "Browser"
+                    st.success(f"Job `{new_job['id']}` started via {engine_desc}!")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Job initialization error: {ex}")
 
         if active:
             st.divider()
             st.markdown(f"**Current Job:** `{active['id']}`")
             st.markdown(f"**Current State:** `{active['status']}`")
+
+            # Dynamic Progress Bar & Step Calculation
+            transitions = db.get_job_transitions(active["id"])
+            latest_note = transitions[-1]["note"] if transitions and transitions[-1].get("note") else ""
+            
+            # Estimate progress based on current state and chunk progress
+            STATE_PROGRESS_MAP = {
+                JobState.QUEUED.value: 0.05,
+                JobState.VALIDATING_INPUT.value: 0.10,
+                JobState.STARTING_BROWSER.value: 0.20,
+                JobState.WAITING_FOR_AUTH.value: 0.25,
+                JobState.WAITING_FOR_USER_READY.value: 0.30,
+                JobState.UPLOADING.value: 0.45,
+                JobState.CONFIRMING_ATTACHMENT.value: 0.55,
+                JobState.SUBMITTING.value: 0.65,
+                JobState.WAITING_FOR_RESPONSE.value: 0.75,
+                JobState.CAPTURING_RESPONSE.value: 0.85,
+                JobState.RAW_RESPONSE_SAVED.value: 0.90,
+                JobState.PARSING_JSON.value: 0.93,
+                JobState.VALIDATING_SCHEMA.value: 0.97,
+                JobState.COMPLETED.value: 1.0,
+                JobState.NEEDS_USER_ACTION.value: 0.50,
+            }
+
+            base_pct = STATE_PROGRESS_MAP.get(active["status"], 0.30)
+            
+            # Check if note contains chunk progress e.g. "Chunk 2/6"
+            import re
+            chunk_match = re.search(r"Chunk (\d+)/(\d+)", latest_note)
+            if chunk_match:
+                curr_c, tot_c = int(chunk_match.group(1)), int(chunk_match.group(2))
+                if tot_c > 0:
+                    chunk_pct = (curr_c - 1) / tot_c
+                    # Scale chunk processing across 0.25 -> 0.90
+                    progress_val = 0.25 + (chunk_pct * 0.65)
+                    progress_text = f"Processing Chunk {curr_c} of {tot_c} ({latest_note})"
+                else:
+                    progress_val = base_pct
+                    progress_text = f"{active['status']} — {latest_note}"
+            else:
+                progress_val = base_pct
+                progress_text = f"{active['status']} — {latest_note}" if latest_note else active['status']
+
+            progress_val = min(max(progress_val, 0.0), 1.0)
+            st.progress(progress_val, text=f"📊 **Progress: {int(progress_val * 100)}%** — {progress_text}")
 
             if active["status"] == JobState.WAITING_FOR_AUTH.value:
                 st.info(
@@ -329,18 +464,26 @@ elif tab_selection == "🔍 Question Review":
         st.markdown("### Bilingual Question Cards")
         if output_path.exists():
             with open(output_path, "r", encoding="utf-8") as f:
-                questions = json.load(f)
+                output_payload = json.load(f)
 
-            if isinstance(questions, list):
-                for idx, q in enumerate(questions):
-                    with st.expander(f"Question #{idx + 1}: {q.get('subject', '')} / {q.get('topic', '')} ({q.get('type')})", expanded=(idx == 0)):
+            questions_list = (
+                output_payload.get("questions", [])
+                if isinstance(output_payload, dict)
+                else output_payload
+            )
+
+            if isinstance(questions_list, list):
+                st.caption(f"Showing {len(questions_list)} extracted questions")
+                for idx, q in enumerate(questions_list):
+                    chunk_source = f" (Chunk {q.get('_source_chunk')})" if q.get('_source_chunk') else ""
+                    with st.expander(f"Question #{idx + 1}: {q.get('subject', '')} / {q.get('topic', '')} ({q.get('type')}){chunk_source}", expanded=(idx == 0)):
                         q_col1, q_col2 = st.columns(2)
                         with q_col1:
                             st.markdown("**English**")
                             st.write(q.get("en", {}).get("text", ""))
                             for opt in q.get("en", {}).get("options", []):
                                 opt_id = opt.get("id")
-                                is_correct = opt_id == q.get("correctOptionId")
+                                is_correct = opt_id == q.get("correctOptionId") or opt_id == q.get("correct_option_id")
                                 prefix = "🟢 **[CORRECT]** " if is_correct else "⚪ "
                                 st.write(f"{prefix} **{opt_id}**: {opt.get('text')}")
                             st.caption(f"Explanation (EN): {q.get('explanation', {}).get('en', '')}")
@@ -350,7 +493,7 @@ elif tab_selection == "🔍 Question Review":
                             st.write(q.get("hi", {}).get("text", ""))
                             for opt in q.get("hi", {}).get("options", []):
                                 opt_id = opt.get("id")
-                                is_correct = opt_id == q.get("correctOptionId")
+                                is_correct = opt_id == q.get("correctOptionId") or opt_id == q.get("correct_option_id")
                                 prefix = "🟢 **[CORRECT]** " if is_correct else "⚪ "
                                 st.write(f"{prefix} **{opt_id}**: {opt.get('text')}")
                             st.caption(f"Explanation (HI): {q.get('explanation', {}).get('hi', '')}")
@@ -361,10 +504,87 @@ elif tab_selection == "🔍 Question Review":
 # TAB 4: SETTINGS
 # ----------------------------------------------------
 elif tab_selection == "⚙️ Settings":
-    st.subheader("System Settings & Browser Profile")
+    st.subheader("System Settings & Model Configuration")
 
+    st.markdown("### ⚡ Gemini API Settings (Recommended)")
+    st.caption("Official Google Gemini API provides lightning-fast PDF processing with zero bot detection.")
+    
+    api_col1, api_col2 = st.columns([1.5, 1])
+    with api_col1:
+        st_key = st.text_input(
+            "Gemini API Key",
+            value=config.gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
+            type="password",
+            help="Free API key from Google AI Studio",
+        )
+        if st_key:
+            config.gemini_api_key = st_key.strip()
+    with api_col2:
+        st_model = st.selectbox(
+            "Gemini Model",
+            ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+            index=0 if "2.5-flash" in config.gemini_model else (1 if "1.5-flash" in config.gemini_model else 2),
+        )
+        config.gemini_model = st_model
+
+    btn_c1, btn_c2, btn_c3 = st.columns([1, 1, 2])
+    with btn_c1:
+        if st.button("🧪 Test API Connection"):
+            if not config.gemini_api_key:
+                st.error("Please enter a Gemini API Key first.")
+            else:
+                ok, msg = gemini_api_engine.test_connection(config.gemini_api_key)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+    with btn_c2:
+        if st.button("💾 Save Key to .env"):
+            if config.gemini_api_key:
+                env_path = config.base_dir / ".env"
+                with open(env_path, "w", encoding="utf-8") as f:
+                    f.write(f"GEMINI_API_KEY={config.gemini_api_key}\nGEMINI_MODEL={config.gemini_model}\n")
+                st.success("API Key saved to .env file successfully!")
+    with btn_c3:
+        st.markdown("👉 **Need a key?** [Get a Free Gemini API Key at Google AI Studio](https://aistudio.google.com/app/apikey)")
+
+    st.divider()
+
+    st.markdown("### 🌐 Browser Automation & Real Chrome (CDP Mode)")
+    st.caption("For web interface extraction without automated script detection.")
+
+    b_col1, b_col2 = st.columns(2)
+    with b_col1:
+        st.markdown("#### Real Chrome Stealth Launcher")
+        st.info("Launches your installed authentic Google Chrome with remote debugging on port 9222. Websites cannot detect Playwright scripts.")
+        if st.button("🚀 Launch Real Chrome (:9222)", type="primary"):
+            import subprocess
+            import sys
+            subprocess.Popen([sys.executable, "launch_real_chrome.py"])
+            st.success("Launched Real Chrome on port 9222!")
+    with b_col2:
+        st.markdown("#### Browser Provider & CDP")
+        provider_choice = st.selectbox(
+            "Web Assistant Domain",
+            ["Google Gemini (gemini.google.com)", "ChatGPT (chatgpt.com)"],
+            index=0 if config.provider == "gemini" else 1,
+        )
+        if "ChatGPT" in provider_choice:
+            config.provider = "chatgpt"
+            config.target_url = config.chatgpt_url
+        else:
+            config.provider = "gemini"
+            config.target_url = config.gemini_url
+
+        config.use_cdp = st.checkbox(
+            "Connect to Real Chrome via CDP (Port 9222)",
+            value=config.use_cdp,
+            help="Connects to the running Chrome instance launched above."
+        )
+
+    st.divider()
     st.markdown("#### Browser Automation Parameters")
-    st.text_input("Gemini Target URL", value=config.gemini_url, disabled=True)
+    st.text_input("Active Target URL", value=config.target_url, disabled=True)
     st.write(f"Browser Profile Directory: `{config.browser_profile_dir}`")
 
     s_col1, s_col2 = st.columns(2)
@@ -385,8 +605,22 @@ elif tab_selection == "⚙️ Settings":
     config.auto_approve_permission = auto_approve_toggle
 
     st.divider()
-    st.markdown("#### Dedicated Profile Management")
-    st.warning("Resetting the browser profile will remove saved Google session cookies and require re-authentication.")
+    st.markdown("#### Dedicated Profile Management & Manual Login")
+    st.info(
+        "💡 **Manual Sign-In Mode**: Click below to open a permanent browser window without timeouts. "
+        "Log into ChatGPT or Gemini at your own pace, complete 2FA or Captchas, and close the window when done. "
+        "Your session cookies will be permanently saved."
+    )
+    if st.button("🌐 Open Browser for Manual Login", type="secondary"):
+        import subprocess
+        import sys
+        browser_manager.close()
+        browser_manager.kill_stale_chrome_processes()
+        browser_manager.clean_stale_lockfile()
+        subprocess.Popen([sys.executable, "manual_login.py"])
+        st.success("Browser launched! Please log in, and close the browser window when you are done.")
+
+    st.warning("Resetting the browser profile will remove saved session cookies and require re-authentication.")
     if st.button("⚠️ Reset / Clear Dedicated Browser Profile", type="secondary"):
         browser_manager.close()
         if config.browser_profile_dir.exists():
