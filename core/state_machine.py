@@ -52,6 +52,10 @@ ALLOWED_TRANSITIONS: Dict[JobState, Set[JobState]] = {
         JobState.WAITING_FOR_AUTH,
         JobState.WAITING_FOR_USER_READY,
         JobState.UPLOADING,
+        JobState.CONFIRMING_ATTACHMENT,
+        JobState.SUBMITTING,
+        JobState.WAITING_FOR_RESPONSE,
+        JobState.CAPTURING_RESPONSE,
         JobState.FAILED_RETRYABLE,
         JobState.FAILED_PERMANENT,
         JobState.NEEDS_USER_ACTION,
@@ -131,6 +135,7 @@ ALLOWED_TRANSITIONS: Dict[JobState, Set[JobState]] = {
     },
     # Recovery and Paused states
     JobState.NEEDS_USER_ACTION: {
+        JobState.STARTING_BROWSER,
         JobState.WAITING_FOR_AUTH,
         JobState.WAITING_FOR_USER_READY,
         JobState.UPLOADING,
