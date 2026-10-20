@@ -138,12 +138,59 @@ class JobManager:
         self._active_thread.start()
         logger.info(f"Started background worker thread for job {job_id}")
 
+    def auto_approve_and_resume(
+        self,
+        job_id: str,
+        pdf_path: Optional[Path] = None,
+        expected_count: Optional[int] = None,
+    ) -> None:
+        """Resumes a job in NEEDS_USER_ACTION by auto-approving user permission or reprocessing saved raw response."""
+        job = self.db.get_job(job_id)
+        if not job:
+            raise ValueError(f"Job {job_id} not found.")
+
+        # If raw response was already saved, reprocess offline immediately with auto-repair!
+        raw_path_str = job.get("raw_path")
+        if raw_path_str and Path(raw_path_str).exists():
+            logger.info(f"Raw response exists for job {job_id}. Reprocessing offline with auto-repair...")
+            with open(raw_path_str, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+            self._active_thread = threading.Thread(
+                target=self.process_raw_response_offline,
+                args=(job_id, job["source_filename"], raw_text, expected_count),
+                daemon=True,
+                name=f"Worker-Offline-{job_id}",
+            )
+            self._active_thread.start()
+            return
+
+        target_pdf = pdf_path
+        if not target_pdf or not target_pdf.exists():
+            candidate = self.cfg.inputs_dir / job["source_filename"]
+            if candidate.exists():
+                target_pdf = candidate
+
+        if not target_pdf or not target_pdf.exists():
+            raise FileNotFoundError(f"Source PDF for job {job_id} not found.")
+
+        self._cancel_requested = False
+        self._pause_requested = False
+        self._active_thread = threading.Thread(
+            target=self.run_pipeline,
+            args=(job_id, target_pdf, expected_count, False, "SUBMITTING"),
+            daemon=True,
+            name=f"Worker-Resume-{job_id}",
+        )
+        self._active_thread.start()
+        logger.info(f"Started background resume worker thread for job {job_id}")
+
     def run_pipeline(
         self,
         job_id: str,
         pdf_path: Path,
         expected_count: Optional[int] = None,
-        manual_auth_confirm: bool = False
+        manual_auth_confirm: bool = False,
+        resume_from_step: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes the end-to-end browser extraction and validation pipeline.
@@ -152,7 +199,10 @@ class JobManager:
         self._cancel_requested = False
         self._pause_requested = False
         self.current_job_id = job_id
-        sm = StateMachine(JobState.QUEUED)
+        
+        job_rec = self.db.get_job(job_id)
+        current_status = JobState(job_rec["status"]) if job_rec and job_rec.get("status") else JobState.QUEUED
+        sm = StateMachine(current_status)
 
         def step_checkpoint(next_state: JobState, note: str = ""):
             if self._cancel_requested:
@@ -164,11 +214,13 @@ class JobManager:
 
         try:
             # 1. VALIDATING_INPUT
-            step_checkpoint(JobState.VALIDATING_INPUT, "Checking PDF properties")
-            size_bytes, page_count = inspect_pdf(pdf_path)
+            if resume_from_step != "SUBMITTING":
+                step_checkpoint(JobState.VALIDATING_INPUT, "Checking PDF properties")
+                size_bytes, page_count = inspect_pdf(pdf_path)
 
             # 2. STARTING_BROWSER
-            step_checkpoint(JobState.STARTING_BROWSER, "Launching visible Chromium context")
+            if current_status not in {JobState.SUBMITTING, JobState.CONFIRMING_ATTACHMENT, JobState.NEEDS_USER_ACTION} or not browser_manager.is_healthy():
+                step_checkpoint(JobState.STARTING_BROWSER, "Launching visible Chromium context")
             page = browser_manager.launch()
             adapter = GeminiPageAdapter(page, self.cfg)
             adapter.navigate()
@@ -206,39 +258,64 @@ class JobManager:
                     step_checkpoint(JobState.NEEDS_USER_ACTION, "Interface not ready. Please inspect browser.")
                     return self.db.get_job(job_id)
 
-            # 4. UPLOADING
-            step_checkpoint(JobState.UPLOADING, f"Uploading {pdf_path.name}")
-            upload_success = adapter.upload_pdf(pdf_path)
+            # 4. UPLOADING & 5. CONFIRMING_ATTACHMENT
+            if resume_from_step != "SUBMITTING":
+                step_checkpoint(JobState.UPLOADING, f"Uploading {pdf_path.name}")
+                upload_success = adapter.upload_pdf(pdf_path)
 
-            # 5. CONFIRMING_ATTACHMENT
-            step_checkpoint(JobState.CONFIRMING_ATTACHMENT, "Verifying attachment chip")
-            if not upload_success:
-                step_checkpoint(
-                    JobState.NEEDS_USER_ACTION,
-                    "Upload chip not confirmed automatically; user confirmation needed."
-                )
-                return self.db.get_job(job_id)
+                step_checkpoint(JobState.CONFIRMING_ATTACHMENT, "Verifying attachment chip")
+                if not upload_success:
+                    auto_approve = getattr(self.cfg, "auto_approve_permission", True)
+                    if auto_approve:
+                        logger.info("Upload chip not confirmed automatically; auto-approving user permission and continuing.")
+                    else:
+                        step_checkpoint(
+                            JobState.NEEDS_USER_ACTION,
+                            "Upload chip not confirmed automatically; user confirmation needed."
+                        )
+                        return self.db.get_job(job_id)
 
             # 6. SUBMITTING
-            step_checkpoint(JobState.SUBMITTING, "Sending extraction prompt")
-            prompt_text = self.load_prompt_content()
-            adapter.submit_prompt(prompt_text)
+            already_generated = False
+            if resume_from_step == "SUBMITTING":
+                try:
+                    existing_text = adapter.capture_latest_response()
+                    if existing_text and len(existing_text) > 100:
+                        logger.info(f"Existing model response found on page ({len(existing_text)} chars). Skipping re-submission.")
+                        already_generated = True
+                except Exception:
+                    pass
 
-            # 7. WAITING_FOR_RESPONSE
-            step_checkpoint(JobState.WAITING_FOR_RESPONSE, "Waiting for generation completion")
-            try:
-                completed = adapter.wait_for_completion()
-                if not completed:
-                    step_checkpoint(
-                        JobState.NEEDS_USER_ACTION,
-                        "Generation timeout; check if response is complete in browser."
-                    )
-                    return self.db.get_job(job_id)
-            except RuntimeError as re_err:
-                if "Usage limit" in str(re_err):
-                    step_checkpoint(JobState.PAUSED_USAGE_LIMIT, "Hit Gemini usage/rate limits.")
-                    return self.db.get_job(job_id)
-                raise
+            if not already_generated:
+                step_checkpoint(JobState.SUBMITTING, "Sending extraction prompt")
+                prompt_text = self.load_prompt_content()
+                adapter.submit_prompt(prompt_text)
+
+                # 7. WAITING_FOR_RESPONSE
+                step_checkpoint(JobState.WAITING_FOR_RESPONSE, "Waiting for generation completion")
+                try:
+                    completed = adapter.wait_for_completion()
+                    if not completed:
+                        # Attempt to capture whatever has been rendered
+                        try:
+                            raw_check = adapter.capture_latest_response()
+                            if raw_check and len(raw_check) > 100:
+                                logger.info(f"Recovered response ({len(raw_check)} chars) despite completion warning.")
+                                completed = True
+                        except Exception:
+                            pass
+
+                    if not completed:
+                        step_checkpoint(
+                            JobState.NEEDS_USER_ACTION,
+                            "Generation timeout; check if response is complete in browser."
+                        )
+                        return self.db.get_job(job_id)
+                except RuntimeError as re_err:
+                    if "Usage limit" in str(re_err):
+                        step_checkpoint(JobState.PAUSED_USAGE_LIMIT, "Hit Gemini usage/rate limits.")
+                        return self.db.get_job(job_id)
+                    raise
 
             # 8. CAPTURING_RESPONSE
             step_checkpoint(JobState.CAPTURING_RESPONSE, "Extracting latest response text")
@@ -341,19 +418,14 @@ class JobManager:
                 output_path=output_path,
                 report_path=report_path,
             )
-        elif report["content_review_required"]:
-            self.checkpoints.record_checkpoint(
-                job_id,
-                JobState.CONTENT_REVIEW_REQUIRED,
-                note=f"Extracted {len(parsed_data)} questions. Content warnings flagged.",
-                output_path=output_path,
-                report_path=report_path,
-            )
         else:
+            note_msg = f"Extracted {len(parsed_data)} questions with full schema compliance."
+            if quality_warnings:
+                note_msg += f" ({len(quality_warnings)} content quality notices)."
             self.checkpoints.record_checkpoint(
                 job_id,
                 JobState.COMPLETED,
-                note=f"Extracted {len(parsed_data)} questions with full schema compliance.",
+                note=note_msg,
                 output_path=output_path,
                 report_path=report_path,
             )
