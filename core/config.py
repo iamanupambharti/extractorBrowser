@@ -37,8 +37,11 @@ class AppConfig:
     # Timeouts (in seconds)
     page_load_timeout_s: int = 60
     element_wait_timeout_s: int = 25
-    generation_timeout_s: int = 300
-    upload_timeout_s: int = 60
+    generation_timeout_s: int = 420
+    upload_timeout_s: int = 20
+    
+    # Permissions and Auto-approval
+    auto_approve_permission: bool = True
     
     # Retry and execution policies
     max_retries: int = 2
