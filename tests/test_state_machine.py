@@ -43,3 +43,11 @@ def test_terminal_state_cannot_transition():
     sm = StateMachine(JobState.COMPLETED)
     with pytest.raises(InvalidStateTransitionError):
         sm.transition_to(JobState.QUEUED)
+
+def test_needs_user_action_recovery_transitions():
+    sm = StateMachine(JobState.CONFIRMING_ATTACHMENT)
+    sm.transition_to(JobState.NEEDS_USER_ACTION)
+    assert sm.current_state == JobState.NEEDS_USER_ACTION
+    # Can resume directly to SUBMITTING or STARTING_BROWSER
+    sm.transition_to(JobState.SUBMITTING)
+    assert sm.current_state == JobState.SUBMITTING
