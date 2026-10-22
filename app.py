@@ -69,8 +69,11 @@ if tab_selection == "🚀 Dashboard":
         if uploaded_file is not None:
             config.ensure_directories()
             saved_path = config.inputs_dir / uploaded_file.name
-            with open(saved_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+            file_bytes = uploaded_file.getvalue()
+            # Only write if file does not exist or size changed to prevent ERR_UPLOAD_FILE_CHANGED during upload
+            if not saved_path.exists() or saved_path.stat().st_size != len(file_bytes):
+                with open(saved_path, "wb") as f:
+                    f.write(file_bytes)
             target_pdf_path = saved_path
         elif manual_path.strip():
             candidate = Path(manual_path.strip())
@@ -121,6 +124,19 @@ if tab_selection == "🚀 Dashboard":
                     "👉 **Please sign in to Google in the visible Chromium window.**\n\n"
                     "Once you are signed in and Gemini loads, the automation will automatically detect it and continue."
                 )
+            elif active["status"] == JobState.NEEDS_USER_ACTION.value:
+                st.warning(
+                    "👉 **Auto-Approval Available:** The job requires confirmation (e.g. upload chip verification).\n\n"
+                    "Click **'Auto-Approve & Continue'** to immediately approve and send the prompt to Gemini."
+                )
+                if st.button("✅ Auto-Approve & Continue", type="primary"):
+                    try:
+                        job_manager.auto_approve_and_resume(active["id"])
+                        st.success(f"Job `{active['id']}` auto-approved! Resuming pipeline...")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Error resuming job: {ex}")
 
             c1, c2 = st.columns(2)
             with c1:
@@ -134,9 +150,10 @@ if tab_selection == "🚀 Dashboard":
                     st.error("Job cancelled.")
                     st.rerun()
 
-            # Auto-refresh loop while job is active
-            time.sleep(2)
-            st.rerun()
+            # Auto-refresh loop while job is actively running in background
+            if active["status"] != JobState.NEEDS_USER_ACTION.value:
+                time.sleep(2)
+                st.rerun()
 
         st.divider()
         st.markdown("### 3. Artifact Folders")
@@ -176,17 +193,34 @@ elif tab_selection == "📋 Job Ledger":
             if job.get("error_message"):
                 st.error(f"Error [{job.get('error_code')}]: {job.get('error_message')}")
 
-            # Offline reprocess button if raw response exists
-            if job.get("raw_path") and Path(job["raw_path"]).exists():
-                if st.button("🔄 Reprocess Raw Response Offline"):
-                    with open(job["raw_path"], "r", encoding="utf-8") as rf:
-                        raw_content = rf.read()
-                    with st.spinner("Reparsing and revalidating..."):
-                        job_manager.process_raw_response_offline(
-                            job["id"], job["source_filename"], raw_content
-                        )
-                    st.success("Reprocess completed!")
-                    st.rerun()
+            # Action & Download buttons
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                # Offline reprocess button if raw response exists
+                if job.get("raw_path") and Path(job["raw_path"]).exists():
+                    if st.button("🔄 Reprocess Raw Response Offline"):
+                        with open(job["raw_path"], "r", encoding="utf-8") as rf:
+                            raw_content = rf.read()
+                        with st.spinner("Reparsing and revalidating..."):
+                            job_manager.process_raw_response_offline(
+                                job["id"], job["source_filename"], raw_content
+                            )
+                        st.success("Reprocess completed!")
+                        st.rerun()
+
+            with btn_col2:
+                if job.get("output_path") and Path(job["output_path"]).exists():
+                    out_p = Path(job["output_path"])
+                    with open(out_p, "r", encoding="utf-8") as f:
+                        j_bytes = f.read()
+                    st.download_button(
+                        label="📥 Download Final JSON",
+                        data=j_bytes,
+                        file_name=out_p.name,
+                        mime="application/json",
+                        type="primary",
+                        key=f"dl_ledger_{job['id']}",
+                    )
 
             st.markdown("##### State Transition Audit Trail")
             transitions = db.get_job_transitions(job_id)
@@ -215,6 +249,48 @@ elif tab_selection == "🔍 Question Review":
         report_path = (
             Path(selected_job["report_path"]) if selected_job.get("report_path") else None
         )
+        raw_path = (
+            Path(selected_job["raw_path"]) if selected_job.get("raw_path") else None
+        )
+
+        # Direct Artifact Download Actions
+        dl_col1, dl_col2, dl_col3 = st.columns(3)
+        with dl_col1:
+            if output_path.exists():
+                with open(output_path, "r", encoding="utf-8") as f:
+                    final_json_text = f.read()
+                st.download_button(
+                    label="📥 Download Final JSON",
+                    data=final_json_text,
+                    file_name=output_path.name,
+                    mime="application/json",
+                    type="primary",
+                    key=f"dl_rev_json_{selected_job['id']}",
+                )
+        with dl_col2:
+            if report_path and report_path.exists():
+                with open(report_path, "r", encoding="utf-8") as f:
+                    report_json_text = f.read()
+                st.download_button(
+                    label="📊 Download Validation Report",
+                    data=report_json_text,
+                    file_name=report_path.name,
+                    mime="application/json",
+                    key=f"dl_rev_rep_{selected_job['id']}",
+                )
+        with dl_col3:
+            if raw_path and raw_path.exists():
+                with open(raw_path, "r", encoding="utf-8") as f:
+                    raw_resp_text = f.read()
+                st.download_button(
+                    label="📝 Download Raw Response",
+                    data=raw_resp_text,
+                    file_name=raw_path.name,
+                    mime="text/plain",
+                    key=f"dl_rev_raw_{selected_job['id']}",
+                )
+
+        st.divider()
 
         r_col1, r_col2 = st.columns([1, 1])
 
@@ -298,6 +374,15 @@ elif tab_selection == "⚙️ Settings":
     with s_col2:
         st.number_input("Max Retries", value=config.max_retries, disabled=True)
         st.text_input("Prompt Version", value=config.prompt_version, disabled=True)
+
+    st.divider()
+    st.markdown("#### Automation Policies")
+    auto_approve_toggle = st.checkbox(
+        "Auto-approve user permission when attachment chip is pending",
+        value=config.auto_approve_permission,
+        help="When enabled, pipeline will automatically proceed with prompt submission if attachment chip is not immediately verified."
+    )
+    config.auto_approve_permission = auto_approve_toggle
 
     st.divider()
     st.markdown("#### Dedicated Profile Management")
