@@ -1,0 +1,92 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExamForgeQuestionBank",
+  "description": "Canonical bilingual question-bank JSON Schema for ExamForge",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": [
+      "type",
+      "en",
+      "hi",
+      "correctOptionId",
+      "subject",
+      "topic",
+      "has_image",
+      "explanation"
+    ],
+    "properties": {
+      "type": {
+        "type": "string",
+        "enum": ["MCQ"]
+      },
+      "en": {
+        "type": "object",
+        "required": ["text", "options"],
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "required": ["id", "text"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "text": {"type": "string"}
+              }
+            }
+          }
+        }
+      },
+      "hi": {
+        "type": "object",
+        "required": ["text", "options"],
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "required": ["id", "text"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "text": {"type": "string"}
+              }
+            }
+          }
+        }
+      },
+      "correctOptionId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "subject": {
+        "type": "string",
+        "minLength": 1
+      },
+      "topic": {
+        "type": "string",
+        "minLength": 1
+      },
+      "has_image": {
+        "type": "boolean"
+      },
+      "explanation": {
+        "type": "object",
+        "required": ["en", "hi"],
+        "properties": {
+          "en": {"type": "string"},
+          "hi": {"type": "string"}
+        }
+      }
+    }
+  }
+}
