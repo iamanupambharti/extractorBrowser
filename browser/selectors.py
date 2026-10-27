@@ -6,15 +6,33 @@ from typing import List
 
 # Sign-in detection selectors (if these appear, manual login is needed)
 AUTH_INDICATORS: List[str] = [
+    # Gemini
     "a[href*='accounts.google.com/signin']",
     "a:has-text('Sign in')",
     "button:has-text('Sign in')",
     "text='Sign in to Gemini'",
     "text='Sign in with Google'",
+    # ChatGPT
+    "button[data-testid='login-button']",
+    "a[href*='/auth/login']",
+    "button:has-text('Log in')",
+    "button:has-text('Sign up')",
+    "text='Welcome to ChatGPT'",
+    "text='Log in with your OpenAI account'",
 ]
 
 # Prompt composer input element locators
 COMPOSER_SELECTORS: List[str] = [
+    # ChatGPT
+    "#prompt-textarea",
+    "textarea#prompt-textarea",
+    "div#prompt-textarea[contenteditable='true']",
+    "div[id='prompt-textarea']",
+    "textarea[placeholder*='Message ChatGPT']",
+    "textarea[placeholder*='Ask anything']",
+    "textarea[placeholder*='Message']",
+    "form textarea",
+    # Gemini
     "div[role='textbox'][contenteditable='true']",
     "rich-textarea div[contenteditable='true']",
     "div[aria-label*='Ask Gemini']",
@@ -26,6 +44,13 @@ COMPOSER_SELECTORS: List[str] = [
 
 # Send / Submit button locators
 SEND_BUTTON_SELECTORS: List[str] = [
+    # ChatGPT
+    "button[data-testid='send-button']",
+    "button[data-testid='fruitjuice-send-button']",
+    "button[aria-label='Send prompt']",
+    "button[aria-label='Send message']",
+    "form button[type='submit']",
+    # Gemini
     "button[aria-label*='Send message']",
     "button[aria-label*='Send prompt']",
     "button[aria-label='Send']",
@@ -36,6 +61,12 @@ SEND_BUTTON_SELECTORS: List[str] = [
 
 # Upload / Attachment trigger locators
 UPLOAD_BUTTON_SELECTORS: List[str] = [
+    # ChatGPT
+    "button[aria-label='Attach files']",
+    "button[aria-label*='Attach']",
+    "button[data-testid='attach-button']",
+    "button[aria-label*='Upload']",
+    # Gemini
     "button[aria-label*='Add files']",
     "button[aria-label*='Upload files']",
     "button[aria-label*='Upload file']",
@@ -119,8 +150,14 @@ STOP_GENERATION_SELECTORS: List[str] = [
     "button:has(mat-icon:has-text('stop'))",
 ]
 
-# Response completed indicators (rendered by Gemini only after generation concludes)
+# Response completed indicators (rendered after generation concludes)
 RESPONSE_COMPLETED_SELECTORS: List[str] = [
+    # ChatGPT
+    "button[data-testid='copy-turn-action-button']",
+    "button[aria-label='Copy']",
+    "button[aria-label='Good response']",
+    "button[aria-label='Bad response']",
+    # Gemini
     "button[aria-label*='Copy']",
     "button[aria-label*='Copy response']",
     "button[aria-label*='Copy code']",
@@ -135,13 +172,17 @@ RESPONSE_COMPLETED_SELECTORS: List[str] = [
 
 # Assistant response message containers
 RESPONSE_CONTAINER_SELECTORS: List[str] = [
+    # ChatGPT
+    "div[data-message-author-role='assistant']",
+    "div.agent-turn",
+    "div.markdown",
+    # Gemini
     "model-response",
     "message-content",
     ".model-response-text",
     ".response-container",
     "[data-test-id='model-response-text']",
     "div.presented-content",
-    "div.markdown",
     "pre code",
 ]
 
