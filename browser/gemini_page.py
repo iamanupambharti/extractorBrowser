@@ -18,16 +18,18 @@ class GeminiPageAdapter:
         self.cfg = app_config
 
     def navigate(self) -> None:
-        """Navigates to Gemini home URL if not already there."""
+        """Navigates to configured target URL (ChatGPT or Gemini)."""
+        target_url = getattr(self.cfg, "target_url", getattr(self.cfg, "chatgpt_url", "https://chatgpt.com"))
         current_url = ""
         try:
             current_url = self.page.url
         except Exception:
             pass
 
-        if not current_url or ("gemini.google.com" not in current_url and "accounts.google.com" not in current_url):
-            logger.info(f"Navigating to Gemini: {self.cfg.gemini_url}")
-            self.page.goto(self.cfg.gemini_url, wait_until="domcontentloaded")
+        domain_match = ("chatgpt.com" in current_url) if "chatgpt" in target_url else ("gemini.google.com" in current_url)
+        if not current_url or not domain_match:
+            logger.info(f"Navigating to: {target_url}")
+            self.page.goto(target_url, wait_until="domcontentloaded")
             time.sleep(2)
         else:
             logger.info(f"Browser already on target domain: {current_url}")
@@ -46,11 +48,16 @@ class GeminiPageAdapter:
     def check_is_auth_required(self) -> bool:
         """Checks if page is on sign-in page or shows authentication prompts."""
         try:
-            if "accounts.google.com" in self.page.url:
-                logger.info("URL indicates Google authentication page.")
+            url = self.page.url
+            if "accounts.google.com" in url or "/auth/login" in url or "auth0" in url:
+                logger.info(f"URL indicates authentication page: {url}")
                 return True
         except Exception:
             pass
+
+        # If composer is already ready, auth is NOT required
+        if self.is_composer_ready():
+            return False
 
         for sel in selectors.AUTH_INDICATORS:
             try:
@@ -59,7 +66,9 @@ class GeminiPageAdapter:
                     return True
             except Exception:
                 continue
-        return False
+
+        # If composer is not visible and not on main app page, assume auth / login needed
+        return not self.is_composer_ready()
 
     def is_composer_ready(self) -> bool:
         """Checks if prompt composer input is available."""
@@ -186,26 +195,38 @@ class GeminiPageAdapter:
         composer.click()
         time.sleep(0.5)
 
-        # Fill text or insert text
+        # 1. Fill text or insert text into composer
         try:
+            # Clear any leftover draft first
+            composer.click()
+            self.page.keyboard.press("Control+A")
+            self.page.keyboard.press("Backspace")
+            time.sleep(0.3)
             composer.fill(prompt_text)
         except Exception:
             # Fallback for rich-text div
+            composer.click()
             self.page.keyboard.insert_text(prompt_text)
 
-        time.sleep(1)
+        time.sleep(1.5)
 
-        # Click send button
+        # 2. Trigger Send: Click send button or press Enter
+        sent = False
         send_btn = self.find_first_visible(selectors.SEND_BUTTON_SELECTORS, timeout_s=3.0)
         if send_btn and send_btn.is_enabled():
-            send_btn.click()
-            logger.info("Clicked send button.")
-        else:
-            # Fallback: Enter key
-            logger.info("Send button not enabled/found, pressing Enter key.")
+            try:
+                send_btn.click()
+                logger.info("Clicked send button.")
+                sent = True
+            except Exception as e:
+                logger.debug(f"Click on send button failed: {e}")
+
+        if not sent:
+            logger.info("Send button not enabled/clicked; focusing composer and sending Enter key.")
+            composer.focus()
             self.page.keyboard.press("Enter")
 
-        time.sleep(2)
+        time.sleep(3)
         return True
 
     def check_for_usage_limit(self) -> bool:
@@ -230,13 +251,18 @@ class GeminiPageAdapter:
                     '.response-container',
                     '[data-test-id="model-response-text"]',
                     'div.presented-content',
-                    'div.markdown'
+                    'div.markdown',
+                    '.response-body',
+                    'pre',
+                    'code'
                 ];
                 for (const s of sels) {
                     const els = document.querySelectorAll(s);
                     if (els.length > 0) {
-                        const txt = els[els.length - 1].innerText || '';
-                        if (txt.trim().length > 0) return txt.trim().length;
+                        for (let i = els.length - 1; i >= 0; i--) {
+                            const txt = (els[i].innerText || els[i].textContent || '').trim();
+                            if (txt.length > 0) return txt.length;
+                        }
                     }
                 }
                 return 0;
@@ -259,6 +285,7 @@ class GeminiPageAdapter:
 
         last_len = 0
         stable_count = 0
+        last_progress_time = time.time()
 
         while time.time() - start_time < timeout:
             if self.check_for_usage_limit():
@@ -267,29 +294,37 @@ class GeminiPageAdapter:
             # Strict stop button check (only true stop buttons, no generic text)
             stop_btn = self.find_first_visible(selectors.STOP_GENERATION_SELECTORS, timeout_s=0.5)
 
+            # Check text length directly
+            current_len = self.get_latest_response_length()
+
             # Check for completion action buttons (Copy / Thumbs up) which Gemini only mounts once done
             completed_btn = self.find_first_visible(selectors.RESPONSE_COMPLETED_SELECTORS, timeout_s=0.5)
-            if completed_btn and not stop_btn:
-                logger.info("Generation confirmed complete: copy/action buttons rendered on response.")
+            if completed_btn and not stop_btn and current_len > 20:
+                logger.info(f"Generation confirmed complete: copy/action buttons rendered on response ({current_len} chars).")
                 time.sleep(1)
                 return True
 
-            # Check text length stability
-            current_len = self.get_latest_response_length()
-            if current_len > 100:
+            if current_len > 20:
                 if current_len == last_len:
                     stable_count += 1
-                    # If length is stable for 2 consecutive cycles (>= 6s) and no stop button is active
-                    if stable_count >= 2 and not stop_btn:
+                    # If length has stayed identical for 3 consecutive iterations (~9s) and no stop button
+                    if stable_count >= 3 and not stop_btn:
                         logger.info(f"Generation confirmed complete: response text stable at {current_len} chars.")
                         time.sleep(1)
                         return True
                 else:
                     stable_count = 0
                     last_len = current_len
+                    last_progress_time = time.time()
+
+            # If no new characters generated for 20 seconds and we have text, assume done
+            if current_len > 50 and (time.time() - last_progress_time > 20) and not stop_btn:
+                logger.info(f"Generation assumed complete: no text length change for 20s ({current_len} chars).")
+                time.sleep(1)
+                return True
 
             # Fallback check: composer idle and substantial text present
-            if not stop_btn and self.is_composer_ready() and current_len > 100:
+            if not stop_btn and self.is_composer_ready() and current_len > 50:
                 logger.info(f"Generation complete: composer ready with {current_len} chars generated.")
                 time.sleep(1)
                 return True
@@ -310,35 +345,58 @@ class GeminiPageAdapter:
     def capture_latest_response(self) -> str:
         """
         Extracts the visible text of the latest assistant response message.
-        Uses direct DOM evaluation for highest speed and fidelity on large generations.
+        Uses direct atomic DOM evaluation for highest speed and fidelity on large generations.
         """
         logger.info("Capturing latest model response from page...")
         # Fast direct DOM evaluation (single atomic call)
         try:
             text = self.page.evaluate('''() => {
                 const sels = [
+                    'div[data-message-author-role="assistant"]',
+                    'article[data-testid*="conversation-turn"] div.markdown',
+                    'div.agent-turn div.markdown',
                     'model-response',
                     'message-content',
                     '.model-response-text',
                     '.response-container',
                     '[data-test-id="model-response-text"]',
                     'div.presented-content',
-                    'div.markdown'
+                    'div.markdown',
+                    '.response-body',
+                    'pre',
+                    'code'
                 ];
+                // 1. Try finding elements by selectors, picking the latest non-empty one
                 for (const s of sels) {
                     const els = document.querySelectorAll(s);
-                    if (els.length > 0) {
-                        const txt = els[els.length - 1].innerText.trim();
-                        if (txt.length > 0) return txt;
+                    for (let i = els.length - 1; i >= 0; i--) {
+                        const txt = (els[i].innerText || els[i].textContent || '').trim();
+                        if (txt.length > 20) return txt;
                     }
                 }
-                return "";
+
+                // 2. Fallback: check all elements that look like code blocks or JSON containers
+                const preCode = document.querySelectorAll('pre, code');
+                for (let i = preCode.length - 1; i >= 0; i--) {
+                    const txt = (preCode[i].innerText || preCode[i].textContent || '').trim();
+                    if (txt.includes('{') && txt.length > 20) return txt;
+                }
+
+                // 3. Fallback: broad chat container evaluation
+                const container = document.querySelector('infinite-scroller, div[role="region"], main');
+                if (container) {
+                    const txt = (container.innerText || '').trim();
+                    if (txt.length > 50) return txt;
+                }
+
+                const bodyTxt = (document.body.innerText || '').trim();
+                return bodyTxt.length > 0 ? bodyTxt : "";
             }''')
-            if text and len(text) > 0:
+            if text and len(text.strip()) > 0:
                 logger.info(f"Captured response ({len(text)} chars) via direct DOM evaluation.")
-                return text
+                return text.strip()
         except Exception as e:
-            logger.debug(f"Direct DOM evaluation had error: {e}")
+            logger.warning(f"Direct DOM evaluation had error: {e}")
 
         # Fallback to Playwright locators
         for sel in selectors.RESPONSE_CONTAINER_SELECTORS:
@@ -359,6 +417,12 @@ class GeminiPageAdapter:
             paragraphs = self.page.locator("div[role='region'], div.conversation-container").all_inner_texts()
             if paragraphs:
                 return "\n".join(paragraphs).strip()
+        except Exception:
+            pass
+
+        # Take diagnostic screenshot for debugging if capture fails
+        try:
+            self.take_screenshot("capture_failure")
         except Exception:
             pass
 
