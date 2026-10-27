@@ -62,9 +62,51 @@ class BrowserManager:
                 except Exception as e:
                     logger.debug(f"Could not remove {fname}: {e}")
 
+    def _apply_stealth(self, context_or_page) -> None:
+        """Injects stealth scripts to evade bot / automated script detection."""
+        stealth_js = """
+        // Mask navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+
+        // Mock window.chrome runtime
+        if (!window.chrome) {
+            window.chrome = {};
+        }
+        window.chrome.runtime = window.chrome.runtime || {
+            OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install' },
+            PlatformArch: { X86_64: 'x86-64' },
+            PlatformOs: { WIN: 'win' }
+        };
+
+        // Mock plugins to prevent zero-plugin automated browser detection
+        if (!navigator.plugins || navigator.plugins.length === 0) {
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbhegnghamebmpefzkmmgfanflcou' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin' }
+                ]
+            });
+        }
+
+        // Mock languages
+        if (!navigator.languages || navigator.languages.length === 0) {
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+        }
+        """
+        try:
+            if hasattr(context_or_page, "add_init_script"):
+                context_or_page.add_init_script(stealth_js)
+        except Exception as e:
+            logger.debug(f"Could not apply stealth script: {e}")
+
     def launch(self) -> Page:
         """
-        Launches Chromium with persistent user profile.
+        Launches Chromium with persistent user profile or connects to real Chrome via CDP.
         Returns the active Page instance.
         """
         self.cfg.ensure_directories()
@@ -75,6 +117,25 @@ class BrowserManager:
             logger.info("Reusing existing healthy browser context.")
             return self.page
 
+        # 1. Attempt CDP connection if configured or port 9222 is active
+        use_cdp = getattr(self.cfg, "use_cdp", False)
+        cdp_url = getattr(self.cfg, "cdp_url", "http://localhost:9222")
+        if use_cdp:
+            try:
+                logger.info(f"Connecting to real Chrome instance via CDP at {cdp_url}...")
+                self.playwright = sync_playwright().start()
+                browser = self.playwright.chromium.connect_over_cdp(cdp_url)
+                contexts = browser.contexts
+                self.context = contexts[0] if contexts else browser.new_context()
+                pages = self.context.pages
+                self.page = pages[0] if pages else self.context.new_page()
+                self._apply_stealth(self.context)
+                self.page.set_default_timeout(self.cfg.element_wait_timeout_s * 1000)
+                logger.info("Successfully connected to real Chrome via CDP!")
+                return self.page
+            except Exception as cdp_err:
+                logger.warning(f"Could not connect via CDP ({cdp_err}). Falling back to persistent context.")
+
         args = [
             "--disable-blink-features=AutomationControlled",
             "--start-maximized",
@@ -82,6 +143,7 @@ class BrowserManager:
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
             "--enable-zero-copy",
+            "--disable-infobars",
         ]
 
         # Ignore Playwright default that forces CPU software rendering (SwiftShader)
@@ -99,14 +161,20 @@ class BrowserManager:
             self.playwright = sync_playwright().start()
 
             try:
+                # In visible mode, no_viewport=True allows --start-maximized to occupy the full native display
+                viewport_setting = None if not self.cfg.headless else {"width": self.cfg.viewport_width, "height": self.cfg.viewport_height}
                 self.context = self.playwright.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
                     headless=self.cfg.headless,
-                    viewport={"width": self.cfg.viewport_width, "height": self.cfg.viewport_height},
+                    viewport=viewport_setting,
+                    no_viewport=not self.cfg.headless,
                     args=args,
                     ignore_default_args=ignore_default_args,
                     timeout=self.cfg.page_load_timeout_s * 1000,
                 )
+
+                # Inject stealth anti-detection script
+                self._apply_stealth(self.context)
 
                 pages = self.context.pages
                 if pages:
