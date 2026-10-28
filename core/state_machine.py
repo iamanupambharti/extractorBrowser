@@ -44,6 +44,8 @@ ALLOWED_TRANSITIONS: Dict[JobState, Set[JobState]] = {
     },
     JobState.VALIDATING_INPUT: {
         JobState.STARTING_BROWSER,
+        JobState.SUBMITTING,
+        JobState.UPLOADING,
         JobState.NEEDS_USER_ACTION,
         JobState.FAILED_PERMANENT,
         JobState.CANCELLED,
