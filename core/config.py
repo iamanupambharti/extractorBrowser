@@ -4,8 +4,10 @@ Configuration and settings management for ExamForge Browser.
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 @dataclass
 class AppConfig:
@@ -18,6 +20,7 @@ class AppConfig:
     reports_dir: Path = BASE_DIR / "data" / "reports"
     logs_dir: Path = BASE_DIR / "data" / "logs"
     browser_profile_dir: Path = BASE_DIR / "data" / "browser_profile"
+    chrome_debug_dir: Path = BASE_DIR / "data" / "chrome_debug_profile"
     
     # Prompt and schema paths
     prompts_dir: Path = BASE_DIR / "prompts"
@@ -28,11 +31,23 @@ class AppConfig:
     # Database
     db_path: Path = BASE_DIR / "data" / "examforge.db"
     
+    # Engine Settings
+    # "api" uses official Google Gemini API (no bot detection, fast, reliable)
+    # "browser" uses Playwright/CDP browser automation
+    engine_type: str = "api"
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
     # Browser Automation Settings
+    provider: str = "chatgpt"  # "chatgpt" or "gemini"
+    target_url: str = "https://chatgpt.com"
     gemini_url: str = "https://gemini.google.com/app"
+    chatgpt_url: str = "https://chatgpt.com"
     headless: bool = False
     viewport_width: int = 1280
     viewport_height: int = 900
+    use_cdp: bool = False
+    cdp_url: str = "http://localhost:9222"
     
     # Timeouts (in seconds)
     page_load_timeout_s: int = 60
@@ -49,16 +64,24 @@ class AppConfig:
     prompt_version: str = "1.0.0"
     schema_version: str = "1.0.0"
 
+    # Splitting and Chunking Settings
+    enable_pdf_splitting: bool = False
+    pdf_split_threshold_pages: int = 2
+    pdf_chunk_size_pages: int = 3
+    chunks_dir: Path = BASE_DIR / "data" / "chunks"
+
     def ensure_directories(self) -> None:
         """Create required runtime folders if they do not exist."""
         for folder in [
             self.data_dir,
             self.inputs_dir,
+            self.chunks_dir,
             self.raw_dir,
             self.outputs_dir,
             self.reports_dir,
             self.logs_dir,
             self.browser_profile_dir,
+            self.chrome_debug_dir,
             self.prompts_dir,
             self.schemas_dir,
         ]:
